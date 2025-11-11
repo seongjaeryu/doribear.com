@@ -17,7 +17,7 @@ export const metadata: Metadata = {
     siteName: "doribear.com",
     images: [
       {
-        url: "https://doribear.com/og.png",
+        url: "https://doribear.com/og.png?v=2",
         width: 1920,
         height: 1080,
       },
