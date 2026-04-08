@@ -1,0 +1,194 @@
+---
+title: "Building Bindly — a persistent memory layer for LLMs on Cloudflare"
+description: "How I built an MCP-native knowledge platform on Cloudflare Workers, D1, R2, and Vectorize. Architecture decisions, tradeoffs, and the parts I'd do differently."
+date: 2026-04-08
+published: true
+tags: ["cloudflare", "mcp", "claude", "d1", "r2", "hono", "typescript"]
+---
+
+Every Claude or ChatGPT user runs into the same problem within a week: the model has no memory. You paste the same context every conversation. You screenshot good answers so you don't lose them. You watch ideas vanish when the chat scrolls away.
+
+I built [Bindly](https://bind.ly) to fix that for myself, then realized other people have the same problem, so I'm shipping it.
+
+This post is about the architecture and the decisions I made along the way. It's not a tutorial — it's a "here's what I did, here's what I'd change" writeup. If you're building anything on Cloudflare Workers or designing an MCP server, hopefully there's something useful in here.
+
+## What Bindly does, briefly
+
+Three concepts:
+
+- A **Binding** is a knowledge unit (an article, a note, a conversation excerpt). Every edit creates a new immutable **Version**. Nothing is ever lost.
+- A **Set** groups specific Versions like a playlist. Useful for "the 5 docs I always need at the start of a project."
+- A **Space** is a workspace. Personal (private), team (private/public toggle, GitHub-style), or official (Bindly-managed, permanently public).
+
+LLMs interact with all of this through 29 MCP tools. Humans interact through a React SPA. Public Spaces get real URLs with content negotiation — humans get HTML, LLMs get Markdown, same URL.
+
+## Why Cloudflare for everything
+
+The previous version of Bindly ran on Fly.io with Next.js, Fastify, and SQLite-on-disk. It worked, but the operational pain was real:
+
+- Fly autostop / cold starts felt random
+- File-based SQLite meant single-writer, can't scale horizontally
+- Deploys had visible downtime
+- 11 different domains and 6+ Workers, all with different deploy paths
+- A 10,792-line API monolith I was scared to touch
+
+For v1 I went all-in on Cloudflare:
+
+| Layer | Service |
+|---|---|
+| Edge runtime | Workers (Hono) |
+| SQL metadata | D1 |
+| Content blobs | R2 |
+| Vector search | Vectorize |
+| Embeddings | Workers AI (bge-m3) |
+| Cache | KV |
+| Static SPA | Pages |
+
+Three Workers and one Pages project. Sub-50ms p50 globally, no cold starts, atomic deploys, and `wrangler rollback` when something breaks.
+
+## The architecture
+
+```
+                  ┌─────────────────────┐
+                  │  bind.ly (Gateway)  │
+                  │  - landing          │
+                  │  - SSR public pages │
+                  │  - help, llms.txt   │
+                  └──────────┬──────────┘
+                             │ Service Binding
+                             ▼
+┌──────────────┐    ┌─────────────────┐    ┌──────────┐
+│ bindly.app   │───▶│  API Worker     │───▶│ D1 + R2  │
+│ (React SPA)  │    │  (Hono)         │    │ Vectorize│
+└──────────────┘    └─────────▲───────┘    └──────────┘
+                              │ Service Binding
+                  ┌───────────┴──────────┐
+                  │ mcp.bind.ly (MCP)    │
+                  │ - 29 tools           │
+                  │ - OAuth 2.0 + PKCE   │
+                  └──────────────────────┘
+```
+
+The API Worker is the only thing that touches D1/R2/Vectorize. Everything else talks to it via **Service Bindings** — same Cloudflare network, zero HTTP roundtrip. There's exactly one place where data lives, and exactly one set of authorization rules.
+
+The Gateway Worker is a smart router. For unauthenticated requests it does SSR with full SEO metadata. For authenticated requests it proxies to the SPA. Same URL — different response based on the auth cookie.
+
+## Decision 1: immutability over diffs
+
+The first version of Bindly stored diffs between versions. Cute idea, terrible in practice for two reasons:
+
+1. **LLMs can't produce exact diffs.** I tried five different update modes. The model would produce a diff that almost-but-not-quite applied, the merge would silently corrupt content, and debugging it was a nightmare.
+2. **Storage is cheap.** A typical Binding is a few KB of Markdown. Storing 100 full versions of a Binding is ~500 KB of R2. R2 charges $0.015/GB/month. The cost of storing every full version, forever, is rounding error.
+
+So v1 has exactly one update mode: full content replacement, new immutable Version. The DB schema enforces it (`UNIQUE(binding_id, version)` and no `UPDATE` paths on `versions`).
+
+Side effect: undo is free. Every state the binding has ever been in is still queryable.
+
+## Decision 2: Tier 1 / 1.5 / 2 responses
+
+The first time I pointed Claude at the Bindly MCP server with "list my bindings and summarize each one," it burned through my context window in two calls. The default response was "everything I know about this binding."
+
+So now every retrieval tool takes a `tier` parameter:
+
+- **Tier 1** (~300 tokens): id, name, summary, key points, entities, **token count of full content**, public URL
+- **Tier 1.5** (~800 tokens): everything in Tier 1 + first 500 chars of content as a preview
+- **Tier 2** (full): everything
+
+The token count is in Tier 1 specifically so the model can decide whether to escalate before paying. "Get me Tier 1 of all 50 bindings" is ~15k tokens. The model sees the token counts, picks the 5 it actually wants, and grabs Tier 2 for those.
+
+The preview is stored in `version_metas.content_preview` in D1, so a Tier 1.5 fetch never touches R2. Same speed as Tier 1.
+
+## Decision 3: LLM Context Block in every response
+
+MCP responses are typed as `{ content: [{ type: "text", text: string }] }` — basically a Markdown blob. That means the LLM has to *parse Markdown* to follow a link or paginate.
+
+So every Bindly tool response also includes a structured `_meta.context`:
+
+```typescript
+{
+  content: [{ type: "text", text: "<human-readable markdown>" }],
+  _meta: {
+    context: {
+      binding: { id, name, version, contentTokenCount, publicUrl, textUrl },
+      space: { id, slug, type, isPublic },
+      pagination: { total, page, hasMore }
+    }
+  }
+}
+```
+
+The LLM gets typed fields next to the friendly text. Following a link is `binding.publicUrl`, not "find the URL in the markdown and hope the regex works."
+
+## Decision 4: content negotiation, not separate endpoints
+
+Most apps end up with two paths: a webpage at `/things/123` and an API at `/api/things/123`. Bindly merges them.
+
+`bind.ly/@bindly/getting-started` returns:
+- **HTML** (with OG tags, JSON-LD, styled layout) when called from a browser
+- **Markdown** when called with `Accept: text/markdown` or `?format=md`
+
+Same URL. The Gateway Worker checks the Accept header and the query string.
+
+```typescript
+function negotiateResponse(c, binding) {
+  const wantsMarkdown =
+    c.req.query('format') === 'md' ||
+    c.req.header('Accept')?.includes('text/markdown')
+
+  if (wantsMarkdown) {
+    return c.text(binding.sourceContent, 200, {
+      'Content-Type': 'text/markdown; charset=utf-8',
+      'Cache-Control': 'public, s-maxage=60',
+    })
+  }
+
+  return c.html(renderBindingHTML(binding), 200, {
+    'Cache-Control': 'public, s-maxage=60, stale-while-revalidate=300',
+  })
+}
+```
+
+The win: LLM crawlers and traditional search engines see the same URL space. Your "API documentation" is your "marketing page."
+
+## Decision 5: KV cache fallback for resilience
+
+The API Worker is the single point of failure. If it goes down, everything goes down. But the public reading surface can degrade gracefully.
+
+Every Gateway SSR route writes successful responses to KV with a 5-minute TTL. If the API Worker fails, fall back to KV:
+
+```typescript
+try {
+  const data = await c.env.API.fetch(`/api/public/...`)
+  const binding = await data.json()
+  await c.env.CACHE.put(cacheKey, JSON.stringify(binding), { expirationTtl: 300 })
+  return negotiateResponse(c, binding)
+} catch (err) {
+  const cached = await c.env.CACHE.get(cacheKey)
+  if (cached) {
+    const res = negotiateResponse(c, JSON.parse(cached))
+    res.headers.set('X-Cache-Status', 'stale-fallback')
+    return res
+  }
+  return c.html(renderErrorPage(), 503)
+}
+```
+
+Writes still fail, the SPA still breaks — but the public reading surface keeps working through transient API outages. For an SEO-sensitive product, this is worth the few dozen lines of code.
+
+## What I'd do differently
+
+1. **`@cloudflare/vitest-pool-workers` from day 1.** I wrote a lot of code before adding tests because Workers testing felt awkward. The pool-workers package makes it actually pleasant — D1 in-memory, R2/KV local bindings, real Workers runtime. ~308 tests now and they catch real bugs.
+
+2. **Drizzle migrations as files, not `drizzle-kit push`.** `push` is fast but I lost track of what was actually in production. SQL files committed to git, applied with `wrangler d1 migrations apply` — slower, much better at the "what does prod look like" question.
+
+3. **Token-aware design from day 1.** I added `contentTokenCount` in a late migration. Should have been in migration 0000.
+
+4. **Public-by-URL from day 1.** v0 had per-Binding share links (6 separate MCP tools). v1 collapsed that to "Space is the unit of visibility." Should have started there.
+
+## What's next
+
+- **MCP Resources** (`resources/list` + `resources/read`) — pre-fetch Versions without explicit tool calls
+- **MCP Prompts** (`prompts/list`) — pre-built prompts for common Bindly workflows
+- **Local mode** — SQLite + filesystem for self-hosters. The Repository pattern already isolates the data layer.
+
+If any of this is interesting, [try Bindly](https://bind.ly) — free during beta — and [tell me what's missing](https://bind.ly/@bindly-feedback).

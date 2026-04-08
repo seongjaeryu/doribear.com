@@ -21,6 +21,22 @@ export type Page = {
   slug: string
 }
 
+export type Post = {
+  /** File path relative to `contentDirPath` */
+  _id: string
+  _raw: Local.RawDocumentData
+  type: 'Post'
+  published: boolean
+  title: string
+  description: string
+  date: IsoDateTimeString
+  tags?: string[] | undefined
+  /** MDX file body */
+  body: MDX
+  path: string
+  slug: string
+}
+
 export type Project = {
   /** File path relative to `contentDirPath` */
   _id: string
@@ -46,8 +62,8 @@ export type Project = {
 export type AllTypes = DocumentTypes | NestedTypes
 export type AllTypeNames = DocumentTypeNames | NestedTypeNames
 
-export type DocumentTypes = Page | Project
-export type DocumentTypeNames = 'Page' | 'Project'
+export type DocumentTypes = Page | Post | Project
+export type DocumentTypeNames = 'Page' | 'Post' | 'Project'
 
 export type NestedTypes = never
 export type NestedTypeNames = never
@@ -56,6 +72,7 @@ export type DataExports = {
   allDocuments: DocumentTypes[]
   allPages: Page[]
   allProjects: Project[]
+  allPosts: Post[]
 }
 
 
@@ -76,6 +93,7 @@ declare global {
 
 export type DocumentTypeMap = {
   Page: Page
+  Post: Post
   Project: Project
 }
 

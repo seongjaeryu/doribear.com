@@ -39,6 +39,7 @@ dist/
 .env.test.local
 .env.production.local
 .env*.backup
+.bindly_config.json
 
 # Local runtime configuration
 *.envrc
