@@ -151,15 +151,38 @@ const components = {
 			{...props}
 		/>
 	),
-	code: ({ className, ...props }) => (
-		<code
-			className={clsx(
-				"relative rounded border bg-zinc-300 bg-opacity-25 py-[0.2rem] px-[0.3rem] font-mono text-sm text-zinc-600",
-				className,
-			)}
-			{...props}
-		/>
-	),
+	code: ({ className, children, ...props }) => {
+		// Block code inside <pre>: className has 'language-*' from rehype,
+		// or plain ``` block (no className, but content has newlines).
+		// In both cases, keep transparent bg so the <pre> bg shows through.
+		const isBlock =
+			className?.includes("language-") ||
+			(typeof children === "string" && children.includes("\n"));
+
+		if (isBlock) {
+			return (
+				<code
+					className={clsx("font-mono text-sm text-zinc-100", className)}
+					{...props}
+				>
+					{children}
+				</code>
+			);
+		}
+
+		// Inline code
+		return (
+			<code
+				className={clsx(
+					"relative rounded border bg-zinc-300 bg-opacity-25 py-[0.2rem] px-[0.3rem] font-mono text-sm text-zinc-600",
+					className,
+				)}
+				{...props}
+			>
+				{children}
+			</code>
+		);
+	},
 	Image,
 };
 
